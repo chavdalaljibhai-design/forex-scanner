@@ -1,0 +1,133 @@
+# ELITE Forex Scanner
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import streamlit as st
+from scipy.cluster.hierarchy import fclusterdata
+import requests
+
+PAIRS = [
+    "EURUSD=X","GBPUSD=X","USDJPY=X","USDCHF=X","AUDUSD=X","USDCAD=X",
+    "NZDUSD=X","EURGBP=X","EURJPY=X","GBPJPY=X","AUDJPY=X","CADJPY=X",
+    "CHFJPY=X","EURAUD=X","GBPAUD=X","XAUUSD=X"
+]
+
+TIMEFRAMES = {"Daily": "1d", "Weekly": "1wk"}
+
+TOUCH_MIN = 3
+DISTANCE_THRESHOLD = 0.002
+CLUSTER_TOLERANCE = 0.003
+
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
+
+def get_data(symbol, interval):
+    df = yf.download(symbol, period="9mo", interval=interval, progress=False)
+    df.dropna(inplace=True)
+    return df
+
+def add_body(df):
+    df['body_high'] = df[['Open','Close']].max(axis=1)
+    df['body_low'] = df[['Open','Close']].min(axis=1)
+    return df
+
+def detect_levels(df):
+    levels = []
+    for i in range(2, len(df)-2):
+        level = df['Close'].iloc[i]
+        touches = 0
+        for j in range(len(df)):
+            if df['body_low'].iloc[j] <= level <= df['body_high'].iloc[j]:
+                touches += 1
+        if touches >= TOUCH_MIN:
+            levels.append(level)
+    return np.array(levels)
+
+def cluster_levels(levels):
+    if len(levels) == 0:
+        return []
+    clusters = fclusterdata(levels.reshape(-1,1), t=CLUSTER_TOLERANCE, criterion='distance')
+    zones = []
+    for c in np.unique(clusters):
+        group = levels[clusters == c]
+        zones.append((group.min(), group.max(), len(group)))
+    return zones
+
+def is_engulfing(df):
+    if len(df) < 2:
+        return False
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+    bullish = curr['Close'] > curr['Open'] and prev['Close'] < prev['Open'] and curr['Close'] > prev['Open'] and curr['Open'] < prev['Close']
+    bearish = curr['Close'] < curr['Open'] and prev['Close'] > prev['Open'] and curr['Open'] > prev['Close'] and curr['Close'] < prev['Open']
+    return bullish or bearish
+
+def liquidity_grab(df, zl, zh):
+    last = df.iloc[-1]
+    return (last['High'] > zh and last['Close'] < zh) or (last['Low'] < zl and last['Close'] > zl)
+
+def break_retest(df, zl, zh):
+    if len(df) < 3:
+        return False
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+    breakout = prev['Close'] > zh or prev['Close'] < zl
+    retest = zl <= curr['Close'] <= zh
+    return breakout and retest
+
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    except:
+        pass
+
+st.title("🚀 Forex Scanner")
+
+results = []
+
+for pair in PAIRS:
+    for tf_name, tf in TIMEFRAMES.items():
+        try:
+            df = get_data(pair, tf)
+            df = add_body(df)
+            levels = detect_levels(df)
+            zones = cluster_levels(levels)
+            price = df['Close'].iloc[-1]
+            engulf = is_engulfing(df)
+
+            for zl, zh, strength in zones:
+                near = zl <= price <= zh or abs(price - zl) <= DISTANCE_THRESHOLD
+                if not near:
+                    continue
+
+                liq = liquidity_grab(df, zl, zh)
+                br = break_retest(df, zl, zh)
+
+                signal = ""
+                if liq and engulf:
+                    signal = "STRONG"
+                elif br:
+                    signal = "Break Retest"
+                elif engulf:
+                    signal = "Engulfing"
+
+                if signal:
+                    msg = f"{pair} | {tf_name} | {signal} | Zone {round(zl,5)}-{round(zh,5)}"
+                    send_telegram(msg)
+
+                    results.append({
+                        "Pair": pair,
+                        "TF": tf_name,
+                        "Zone": f"{round(zl,5)}-{round(zh,5)}",
+                        "Strength": strength,
+                        "Signal": signal
+                    })
+        except:
+            continue
+
+if results:
+    st.dataframe(pd.DataFrame(results))
+else:
+    st.write("No trades now")
